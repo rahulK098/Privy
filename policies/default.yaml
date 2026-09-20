@@ -1,0 +1,174 @@
+# Privy default policy.
+#
+# Resolution order for any (entity, destination) — specificity first:
+#   destinations.<dest>.entities.<ENTITY>  >  entities.<ENTITY>
+#   >  destinations.<dest>.defaults        >  defaults
+# Every field is inherited independently, so an override may change only the action.
+# A destination-wide default never loosens an entity-specific threshold.
+#
+# Design intent (see docs/adr/0004-policy-model.md):
+#   * The model often legitimately needs a customer's name to help them -> PERSON is allowed
+#     inbound, but never reaches logs or the vector store in the clear.
+#   * Government IDs, card numbers and credentials are blocked at *every* destination,
+#     including low-confidence hits: the cost of a false block is a retry; the cost of a
+#     leaked SSN is unbounded.
+#   * Logs and the vector store use stricter thresholds than the model path: nobody audits
+#     them, so lean towards over-redaction there.
+
+version: 1
+name: default
+description: Balanced policy for a customer-facing assistant with audited logging.
+
+redact_template: "<{entity}>"
+hash_secret_env: PRIVY_HASH_SECRET
+hash_token_length: 12
+
+defaults:
+  action: redact
+  min_confidence: 0.5
+
+entities:
+  # --- identity -------------------------------------------------------------
+  PERSON:
+    action: redact
+    min_confidence: 0.7          # spaCy tags many proper nouns; be conservative
+    reason: Avoid mangling legitimate proper nouns below 0.7.
+  LOCATION:
+    action: allow
+    min_confidence: 0.85
+    reason: Cities/countries are rarely sensitive on their own.
+  EMAIL_ADDRESS:
+    action: mask                 # j***@example.com keeps the domain for context
+    min_confidence: 0.6
+  PHONE_NUMBER:
+    action: mask                 # ***-***-5309
+    min_confidence: 0.4          # Presidio's phone recognizer scores 0.4 without context words
+  IP_ADDRESS:
+    action: hash
+    min_confidence: 0.6
+
+  # --- high-severity: block regardless of confidence ---------------------------
+  US_SSN:
+    action: block
+    min_confidence: 0.0
+    reason: SSNs must never transit an LLM call or be written anywhere.
+  CREDIT_CARD:
+    action: block
+    min_confidence: 0.0
+    reason: PCI scope; Luhn-validated so false positives are rare.
+  US_BANK_NUMBER:
+    action: block
+    min_confidence: 0.4
+  IBAN_CODE:
+    action: block
+    min_confidence: 0.0
+  US_PASSPORT:
+    action: block
+    min_confidence: 0.4
+  US_DRIVER_LICENSE:
+    action: redact
+    min_confidence: 0.5
+  US_ITIN:
+    action: block
+    min_confidence: 0.0
+  UK_NHS:
+    # Excluded from detection below: the NHS recognizer is a bare mod-11 checksum over any
+    # ten digits, and the eval showed it *blocking* US phone numbers. Remove UK_NHS from
+    # detection.presidio_excluded_entities if you handle UK health data.
+    action: block
+    min_confidence: 0.0
+  STREET_ADDRESS:
+    action: redact
+    min_confidence: 0.5
+    reason: Privy extended recognizer; Presidio has no address recognizer of its own.
+  MEDICAL_LICENSE:
+    action: redact
+    min_confidence: 0.5
+  CRYPTO:
+    action: redact
+    min_confidence: 0.5
+
+  # --- secrets (detect-secrets) -------------------------------------------------
+  AWS_ACCESS_KEY:      { action: block, min_confidence: 0.0, reason: Cloud credential. }
+  GITHUB_TOKEN:        { action: block, min_confidence: 0.0 }
+  GITLAB_TOKEN:        { action: block, min_confidence: 0.0 }
+  OPENAI_TOKEN:        { action: block, min_confidence: 0.0 }
+  STRIPE_ACCESS_KEY:   { action: block, min_confidence: 0.0 }
+  SLACK_TOKEN:         { action: block, min_confidence: 0.0 }
+  PRIVATE_KEY:         { action: block, min_confidence: 0.0 }
+  JWT:                 { action: redact, min_confidence: 0.0 }
+  SECRET_KEYWORD:      { action: redact, min_confidence: 0.6 }
+  HIGH_ENTROPY_STRING:
+    action: allow                # too noisy to act on alone; still audited
+    min_confidence: 0.6
+    reason: Entropy alone is a weak signal; provider-format plugins cover real tokens.
+
+  # --- internal identifiers (custom recognizers) ----------------------------------
+  INTERNAL_CASE_ID:    { action: hash, min_confidence: 0.6 }
+  EMPLOYEE_ID:         { action: hash, min_confidence: 0.6 }
+
+destinations:
+  model:
+    entities:
+      PERSON:
+        action: allow
+        reason: The assistant needs the customer's name to help them.
+      LOCATION:
+        action: allow
+      EMAIL_ADDRESS:
+        action: allow
+        reason: Needed to draft replies; still blocked from logs below.
+      STREET_ADDRESS:
+        action: allow
+        reason: Shipping/support flows need the address; never reaches logs in the clear.
+
+  response:
+    # Completions are echoed back to the caller and frequently logged downstream;
+    # treat the same as inbound but never allow raw SSNs/cards through even if the
+    # model hallucinated one.
+    entities:
+      PERSON:
+        action: allow
+
+  logs:
+    defaults:
+      min_confidence: 0.3        # entities with no rule of their own: over-redact
+    entities:
+      PERSON:
+        action: hash
+        min_confidence: 0.5
+        reason: Correlate a user across log lines without storing the name.
+      EMAIL_ADDRESS: { action: hash,   min_confidence: 0.4 }
+      PHONE_NUMBER:  { action: redact, min_confidence: 0.3 }
+      IP_ADDRESS:    { action: hash,   min_confidence: 0.4 }
+      LOCATION:      { action: redact, min_confidence: 0.6 }
+      HIGH_ENTROPY_STRING: { action: redact }
+      # High-severity entities stay `block` via inheritance; blocking a *log write* means
+      # the log line is dropped, not that the user's request fails (see middleware docs).
+
+  vector_store:
+    defaults:
+      min_confidence: 0.3
+    entities:
+      PERSON:        { action: redact, min_confidence: 0.5 }
+      EMAIL_ADDRESS: { action: redact, min_confidence: 0.4 }
+      PHONE_NUMBER:  { action: redact, min_confidence: 0.3 }
+      IP_ADDRESS:    { action: redact, min_confidence: 0.4 }
+      LOCATION:      { action: redact, min_confidence: 0.6 }
+      HIGH_ENTROPY_STRING: { action: redact }
+
+detection:
+  spacy_model: en_core_web_lg
+  enable_secrets: true
+  enable_extended_recognizers: true      # 2-series Mastercard, street addresses (see docs/eval)
+  # ORGANIZATION/DATE_TIME/URL/NRP are noisy with spaCy lg; UK_NHS false-blocks US phone numbers.
+  presidio_excluded_entities: [ORGANIZATION, DATE_TIME, URL, NRP, UK_NHS]
+  custom_recognizers:
+    - entity_type: INTERNAL_CASE_ID
+      regex: '\bCASE-\d{4}-\d{5,6}\b'
+      score: 0.85
+      context: [case, matter, ticket]
+    - entity_type: EMPLOYEE_ID
+      regex: '\bEMP-\d{6}\b'
+      score: 0.85
+      context: [employee, staff, badge]

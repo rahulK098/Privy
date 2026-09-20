@@ -1,0 +1,39 @@
+# Per important_notes.md: never track these
+docs/
+.claude/
+plan.md
+important_notes.md
+
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.python-version.local
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+eval/reports/*.json
+eval/reports/*.md
+!eval/reports/.gitkeep
+# Generated, deterministic from seed; contains synthetic secrets that trip push protection
+eval/data/*.jsonl
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

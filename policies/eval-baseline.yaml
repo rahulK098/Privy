@@ -1,0 +1,83 @@
+# Reproduces the *pre-fix* configuration for the evaluation report so the effect of the
+# changes documented in docs/eval/ is measurable:
+#   - no extended recognizers (2-series Mastercard, street address)
+#   - UK_NHS still detected and blocking
+# Everything else matches policies/default.yaml. Not for production use.
+
+version: 1
+name: eval-baseline
+description: Presidio + detect-secrets defaults with the shipped policy rules, no Privy fixes.
+
+redact_template: "<{entity}>"
+hash_secret_env: PRIVY_HASH_SECRET
+hash_token_length: 12
+
+defaults:
+  action: redact
+  min_confidence: 0.5
+
+entities:
+  PERSON:            { action: redact, min_confidence: 0.7 }
+  LOCATION:          { action: allow,  min_confidence: 0.85 }
+  EMAIL_ADDRESS:     { action: mask,   min_confidence: 0.6 }
+  PHONE_NUMBER:      { action: mask,   min_confidence: 0.4 }
+  IP_ADDRESS:        { action: hash,   min_confidence: 0.6 }
+  US_SSN:            { action: block,  min_confidence: 0.0 }
+  CREDIT_CARD:       { action: block,  min_confidence: 0.0 }
+  US_BANK_NUMBER:    { action: block,  min_confidence: 0.4 }
+  IBAN_CODE:         { action: block,  min_confidence: 0.0 }
+  US_PASSPORT:       { action: block,  min_confidence: 0.4 }
+  US_DRIVER_LICENSE: { action: redact, min_confidence: 0.5 }
+  US_ITIN:           { action: block,  min_confidence: 0.0 }
+  UK_NHS:            { action: block,  min_confidence: 0.0 }
+  MEDICAL_LICENSE:   { action: redact, min_confidence: 0.5 }
+  CRYPTO:            { action: redact, min_confidence: 0.5 }
+  AWS_ACCESS_KEY:    { action: block,  min_confidence: 0.0 }
+  GITHUB_TOKEN:      { action: block,  min_confidence: 0.0 }
+  GITLAB_TOKEN:      { action: block,  min_confidence: 0.0 }
+  OPENAI_TOKEN:      { action: block,  min_confidence: 0.0 }
+  STRIPE_ACCESS_KEY: { action: block,  min_confidence: 0.0 }
+  SLACK_TOKEN:       { action: block,  min_confidence: 0.0 }
+  PRIVATE_KEY:       { action: block,  min_confidence: 0.0 }
+  JWT:               { action: redact, min_confidence: 0.0 }
+  SECRET_KEYWORD:    { action: redact, min_confidence: 0.6 }
+  HIGH_ENTROPY_STRING: { action: allow, min_confidence: 0.6 }
+  INTERNAL_CASE_ID:  { action: hash,   min_confidence: 0.6 }
+  EMPLOYEE_ID:       { action: hash,   min_confidence: 0.6 }
+
+destinations:
+  model:
+    entities:
+      PERSON:        { action: allow }
+      LOCATION:      { action: allow }
+      EMAIL_ADDRESS: { action: allow }
+  response:
+    entities:
+      PERSON:        { action: allow }
+  logs:
+    defaults: { min_confidence: 0.3 }
+    entities:
+      PERSON:        { action: hash,   min_confidence: 0.5 }
+      EMAIL_ADDRESS: { action: hash,   min_confidence: 0.4 }
+      PHONE_NUMBER:  { action: redact, min_confidence: 0.3 }
+      IP_ADDRESS:    { action: hash,   min_confidence: 0.4 }
+      LOCATION:      { action: redact, min_confidence: 0.6 }
+      HIGH_ENTROPY_STRING: { action: redact }
+  vector_store:
+    defaults: { min_confidence: 0.3 }
+    entities:
+      PERSON:        { action: redact, min_confidence: 0.5 }
+      EMAIL_ADDRESS: { action: redact, min_confidence: 0.4 }
+      PHONE_NUMBER:  { action: redact, min_confidence: 0.3 }
+      IP_ADDRESS:    { action: redact, min_confidence: 0.4 }
+      LOCATION:      { action: redact, min_confidence: 0.6 }
+      HIGH_ENTROPY_STRING: { action: redact }
+
+detection:
+  spacy_model: en_core_web_lg
+  enable_secrets: true
+  enable_extended_recognizers: false
+  presidio_excluded_entities: [ORGANIZATION, DATE_TIME, URL, NRP]
+  custom_recognizers:
+    - { entity_type: INTERNAL_CASE_ID, regex: '\bCASE-\d{4}-\d{5,6}\b', score: 0.85, context: [case, matter, ticket] }
+    - { entity_type: EMPLOYEE_ID,      regex: '\bEMP-\d{6}\b',          score: 0.85, context: [employee, staff, badge] }
