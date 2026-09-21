@@ -1,6 +1,12 @@
-# Privy
+<p align="center">
+  <img src="logo.png" alt="Privy — Guard Your Data. Everywhere." width="720">
+</p>
 
-Policy-driven PII/secrets scrubber that sits in front of every LLM call and every log write.
+<p align="center">
+  Policy-driven PII/secrets scrubber that sits in front of every LLM call and every log write.
+</p>
+
+---
 
 LLM applications have **two** data-governance surfaces: what goes *to* the model, and what gets
 *written down about* the interaction (logs, traces, vector stores). Privy scans both directions,
