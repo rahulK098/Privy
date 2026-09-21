@@ -131,15 +131,21 @@ def _latency(guard: Guard, examples: Sequence[Example], destination: Destination
         except BlockedError:
             pass
         samples.append((time.perf_counter() - started) * 1000.0)
-    quantiles = statistics.quantiles(samples, n=100, method="inclusive")
+    if len(samples) >= 2:
+        quantiles = statistics.quantiles(samples, n=100, method="inclusive")
+        p95, p99 = quantiles[94], quantiles[98]
+    else:  # quantiles need two points; a single sample is its own percentile
+        p95 = p99 = samples[0] if samples else 0.0
     return LatencyStats(
         destination=destination.value,
         samples=len(samples),
-        p50_ms=round(statistics.median(samples), 2),
-        p95_ms=round(quantiles[94], 2),
-        p99_ms=round(quantiles[98], 2),
-        max_ms=round(max(samples), 2),
-        mean_text_length=round(statistics.fmean(len(ex.text) for ex in examples), 1),
+        p50_ms=round(statistics.median(samples), 2) if samples else 0.0,
+        p95_ms=round(p95, 2),
+        p99_ms=round(p99, 2),
+        max_ms=round(max(samples), 2) if samples else 0.0,
+        mean_text_length=round(statistics.fmean(len(ex.text) for ex in examples), 1)
+        if examples
+        else 0.0,
     )
 
 

@@ -8,7 +8,7 @@ applies a per-destination policy, and writes an audit trail that lets a reviewer
 "why was this SSN allowed through?" from the log alone.
 
 Privy does **not** reinvent detection. It wraps [Microsoft Presidio](https://github.com/microsoft/presidio)
-(PII, NER via spaCy) and [detect-secrets](https://github.com/Yelp/detect-secrets) (credentials),
+(PII, spaCy NER) and [detect-secrets](https://github.com/Yelp/detect-secrets) (credentials),
 and adds the parts those tools don't provide: the policy engine, bidirectional middleware,
 audit log, and an evaluation harness that proves the numbers.
 
@@ -17,37 +17,114 @@ audit log, and an evaluation harness that proves the numbers.
 ```bash
 uv sync --all-groups
 uv run python -m spacy download en_core_web_lg   # NER model (~600 MB)
+export PRIVY_HASH_SECRET=...                      # key for deterministic hash tokens
 uv run pytest
 ```
 
 ```python
 import privy
 
-guard = privy.Guard.from_policy("policies/default.yaml")
+guard = privy.Guard.from_policy("policies/default.yaml", audit_db="audit.db")
+guard.warm_up()  # loads spaCy once (~4 s)
 
-with guard.inbound() as scrub:
-    prompt = scrub("Call John Smith at 555-123-4567, SSN 123-45-6789")
-    # -> "Call <PERSON> at <PHONE_NUMBER>, SSN <US_SSN>"  (or BlockedError, per policy)
+# 1. Wrap an LLM call — inputs scrubbed before the provider sees them, outputs after.
+@privy.redacted_call(guard, adapter=privy.ChatMessagesAdapter())
+def chat(*, messages):
+    return client.chat.completions.create(model="gpt-4o", messages=messages)
+
+# 2. Or call the surfaces directly.
+with guard.session(request_id="req-42") as g:
+    prompt = g.inbound("Hi, I'm Maria Gonzalez, card 4111 1111 1111 1111")
+    # -> raises privy.BlockedError: blocked at destination 'model': CREDIT_CARD (rule entities.CREDIT_CARD ...)
+
+    line = g.for_logs("user Maria Gonzalez (maria@example.com) asked about billing")
+    # -> "user <PERSON:9f3a1c…> (<EMAIL_ADDRESS:b07e…>) asked about billing"
+
+# 3. Every log line, automatically.
+import logging
+logging.getLogger().addFilter(privy.PrivyLogFilter(guard))
 ```
+
+The same `PERSON` is **allowed** on the way to the model (the assistant needs the name),
+**hashed** in logs (correlate without storing), and **redacted** in the vector store — one
+YAML file decides, and every decision is written to the audit log with the rule that made it.
+
+## How it works
+
+| Surface | Method | On policy `block` |
+|---|---|---|
+| Prompt → model | `guard.inbound(text)` | raises `BlockedError` |
+| Completion → caller | `guard.outbound(text)` | raises `BlockedError` |
+| Anything → logs / vector DB | `guard.for_logs(text)` / `for_vector_store(text)` | returns `None`; write is dropped |
+
+Policy (`policies/default.yaml`) maps entity → `redact` / `mask` / `hash` / `block` / `allow`
+with a per-entity confidence threshold, and lets each destination (`model`, `response`,
+`logs`, `vector_store`) override any of it. Precedence is specificity-first, so a
+destination-wide default can never loosen an entity-specific rule.
+
+The audit log (SQLite) stores one row per guarded call and one per detection — including
+detections that were allowed or fell below threshold — with the policy path that decided the
+action and an HMAC of the span. Raw values are never stored.
+
+## Evaluation (ship gate)
+
+160 labelled synthetic examples (302 spans, Faker-generated, never real data) and 100 clean
+business documents. Reproduce with `uv run python eval/run.py`.
+
+| Entity | P | R | Entity | P | R |
+|---|---:|---:|---|---:|---:|
+| `US_SSN` | 1.00 | 1.00 | `AWS_ACCESS_KEY` | 1.00 | 1.00 |
+| `CREDIT_CARD` | 1.00 | 1.00 | `GITHUB_TOKEN` | 1.00 | 1.00 |
+| `EMAIL_ADDRESS` | 1.00 | 1.00 | `STRIPE_ACCESS_KEY` | 1.00 | 1.00 |
+| `PERSON` | 0.99 | 0.97 | `PRIVATE_KEY` | 1.00 | 1.00 |
+| `STREET_ADDRESS` | 1.00 | 0.93 | `JWT` | 1.00 | 1.00 |
+| `PHONE_NUMBER` | 1.00 | 0.76 | `SECRET_KEYWORD` | 1.00 | 0.75 |
+
+- **Clean corpus:** 1 % of documents modified at the `model` destination; 35 % at `logs`
+  (spaCy tags capitalised nouns like "Deliverables" as `PERSON` at a fixed 0.85, and the
+  logs policy hashes `PERSON` — a deliberate, reported trade-off).
+- **Latency** (full path, detect + policy + audit, ~74-char inputs): **p50 7.2 ms, p95 9.6 ms**.
+- **Demonstrated block:** an outbound completion echoing an SSN is rejected with a
+  `BlockedError` naming the rule, and the audit rows show why.
+- **Three Presidio gaps found by the eval and closed** with recognizers in `privy.detect.custom`:
+  1. Mastercard 2-series BIN range (2221–2720) missing from Presidio's card regex — recall 0.74 → 1.00.
+  2. `UK_NHS` is a bare mod-11 checksum that scores 1.0 on some US phone numbers; it was
+     *blocking* requests. Excluded from the default detection set (opt-in for UK health data).
+  3. No street-address recognizer; addresses were also being mis-tagged `PERSON`. Added one —
+     recall 0 → 0.93, `PERSON` precision 0.93 → 0.99.
+
+Weakest category is `PHONE_NUMBER` recall (extensions, some `+1` spacings, unallocated NANP
+area codes). The full report, including every miss, lives in `docs/eval/` (local; see below).
 
 ## Project layout
 
 ```
-src/privy/          library code
-  detect/           detection layer (Presidio + detect-secrets wrappers, custom recognizers)
-  policy/           policy schema, loader, decision engine
-  middleware/       inbound / outbound / storage hooks, decorator + context manager
-  audit/            structured audit log (SQLite)
-policies/           shipped YAML policies
-tests/              unit + integration tests
-eval/               eval datasets, harness, reports (ship gate)
-docs/               ADRs, architecture, eval reports  (not tracked in git — see important_notes.md)
+src/privy/
+  detect/       Presidio + detect-secrets adapters, unified Detection schema, custom recognizers
+  policy/       YAML schema, rule resolution, redact/mask/hash actions, PolicyEngine
+  middleware/   Guard, @redacted_call, call adapters, PrivyLogFilter
+  audit/        OperationRecord/DetectionRecord, SQLite + memory sinks
+  evaluation/   dataset builder, span metrics, runner, report
+policies/       default.yaml, eval-baseline.yaml
+eval/           generate.py, run.py  (datasets are generated on demand, not committed)
+tests/          147 tests, 97 % coverage; `-m "not slow"` skips the spaCy-loading ones
+docs/           ADRs 0001–0008, architecture, policy & audit reference, eval reports  (untracked)
 ```
 
-## Documentation
+## Development
 
-See [docs/README.md](docs/README.md) for the documentation index, including
-architecture decision records under `docs/adr/`.
+```bash
+uv run ruff check src tests eval && uv run ruff format --check src tests eval
+uv run mypy src            # --strict
+uv run pytest --cov=privy  # 80 % floor enforced
+```
+
+## Limitations
+
+- English only; spaCy `en_core_web_lg`. Swap in `en_core_web_trf` via `detection.spacy_model`
+  for better NER precision at ~5–10× the latency.
+- Streaming completions are not scrubbed (spans can straddle chunks).
+- detect-secrets confidences are assigned per plugin class, not measured.
 
 ## License
 
